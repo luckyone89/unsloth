@@ -151,6 +151,10 @@ def main() -> None:
             name = body.get("model_name")
             if self.path == "/v1/install":
                 time.sleep(float(os.environ.get("FAKE_LEMOND_INSTALL_SECONDS", "0")))
+                if os.environ.get("FAKE_LEMOND_SYSTEM_FLM"):
+                    # Real lemond answers success without downloading when flm is on PATH.
+                    self._send(200, {"status": "success", "recipe": "flm", "backend": "npu"})
+                    return
                 flm = cache / "bin" / "flm" / "npu" / "flm"
                 flm.parent.mkdir(parents = True, exist_ok = True)
                 report = os.environ.get("FAKE_FLM_VALIDATE", '{"ready": true}')

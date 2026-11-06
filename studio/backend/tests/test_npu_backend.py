@@ -66,6 +66,8 @@ def npu(tmp_path, monkeypatch):
         "detect_amd_npu",
         lambda: {"present": True, "supported": True, "family": "XDNA2", "name": "NPU Strix Halo"},
     )
+    # Hermetic: an flm installed on the test machine must not stand in for lemond's copy.
+    monkeypatch.setattr(nb.shutil, "which", lambda name: None)
     backend = nb.LemonadeNpuBackend(root = tmp_path / "lemonade")
     backend.installer = installer
     yield backend
@@ -673,6 +675,43 @@ def test_an_update_lemond_could_not_download_is_not_recorded_as_done(
         npu.enable()
     assert npu.status()["state"] == "failed"
     assert nb.LemonadeNpuBackend(root = npu.root).status()["ready"] is False
+
+
+def _system_flm(tmp_path: Path, version: str) -> Path:
+    flm = tmp_path / "system" / "bin" / "flm"
+    flm.parent.mkdir(parents = True)
+    flm.write_text(
+        f'#!/bin/sh\n[ "$1" = version ] && {{ echo \'{{"version": "{version}"}}\'; exit 0; }}\n'
+        "echo '{\"ready\": true}'\n",
+        encoding = "utf-8",
+    )
+    flm.chmod(0o755)
+    return flm
+
+
+def test_enable_uses_the_flm_lemond_found_on_path(npu, tmp_path, monkeypatch):
+    # A distro or Nix FastFlowLM: lemond serves it and downloads nothing into its cache.
+    flm = _system_flm(tmp_path, "1.0.3")
+    monkeypatch.setattr(nb.shutil, "which", lambda name: str(flm) if name == "flm" else None)
+    monkeypatch.setenv("FAKE_LEMOND_SYSTEM_FLM", "1")
+    npu.installer.load_pins = lambda: {"fastflowlm": {"version": "v1.0.7"}}
+    status = npu.enable()
+    assert status["ready"] is True
+    assert status["versions"]["fastflowlm"] == "1.0.3"
+    assert npu._flm_binary() == flm
+
+
+def test_studios_own_flm_wins_over_one_on_path(npu, tmp_path, monkeypatch):
+    flm = _system_flm(tmp_path, "1.0.3")
+    monkeypatch.setattr(nb.shutil, "which", lambda name: str(flm) if name == "flm" else None)
+    npu.enable()
+    assert npu._flm_binary() == npu.root / "cache" / "bin" / "flm" / "npu" / "flm"
+
+
+def test_without_any_flm_enable_still_reports_it_missing(npu, monkeypatch):
+    monkeypatch.setenv("FAKE_LEMOND_SYSTEM_FLM", "1")
+    with pytest.raises(nb.NpuError, match = "FastFlowLM was not found after installing it"):
+        npu.enable()
 
 
 def test_a_marker_without_an_install_path_does_not_start_an_upgrade(tmp_path, monkeypatch):

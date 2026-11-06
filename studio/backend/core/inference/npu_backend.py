@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import sys
 import threading
@@ -263,11 +264,21 @@ class LemonadeNpuBackend:
             logger.warning("Could not read the Lemonade install: %s", exc)
             return None
 
-    def _flm_binary(self) -> Optional[Path]:
+    def _managed_flm_binary(self) -> Optional[Path]:
+        """The FastFlowLM lemond downloaded into Studio's cache."""
         name = "flm.exe" if sys.platform == "win32" else "flm"
         base = self.root / "cache" / "bin" / "flm" / "npu"
         candidates = sorted(base.rglob(name)) if base.is_dir() else []
         return candidates[0] if candidates else None
+
+    def _flm_binary(self) -> Optional[Path]:
+        # lemond serves an flm already on PATH (a distro or Nix package) rather than
+        # downloading its own, so Studio must find that one too.
+        managed = self._managed_flm_binary()
+        if managed is not None:
+            return managed
+        found = shutil.which("flm")
+        return Path(found) if found else None
 
     def hardware(self) -> dict[str, Any]:
         if self._hardware is None:
@@ -491,7 +502,13 @@ class LemonadeNpuBackend:
                     raise NpuError(f"Installing FastFlowLM failed: {_error_message(response)}")
                 # lemond keeps the old FastFlowLM and answers success when an update download fails.
                 expected, actual = _pinned_flm_version(), self._flm_version()
-                if expected and actual and actual != expected:
+                # Only Studio's own copy follows the pin; a system flm is updated by its packager.
+                managed = self._managed_flm_binary() is not None
+                if not managed and expected and actual and actual != expected:
+                    logger.warning(
+                        "Using the system FastFlowLM v%s on PATH; Studio pins v%s", actual, expected
+                    )
+                if managed and expected and actual and actual != expected:
                     raise NpuError(
                         f"Updating FastFlowLM to v{expected} failed; v{actual} is still installed. "
                         "Check the internet connection, then try again."
