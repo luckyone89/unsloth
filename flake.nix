@@ -231,11 +231,39 @@
               ]
             );
 
-            # The tray icon dlopens libayatana-appindicator at runtime.
+            # The tray icon dlopens libayatana-appindicator at runtime. The NPU backend
+            # downloads prebuilt Ubuntu binaries into ~/.unsloth/studio/lemonade (lemond and
+            # FastFlowLM's flm), which inherit this LD_LIBRARY_PATH through the Studio
+            # backend. They also need an ELF interpreter at /lib64, i.e. programs.nix-ld.
             preFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               gappsWrapperArgs+=(
-                --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.libayatana-appindicator ]}
+                --prefix LD_LIBRARY_PATH : ${
+                  lib.makeLibraryPath (
+                    with pkgs;
+                    [
+                      libayatana-appindicator
+                      # lemond
+                      zlib
+                      zstd
+                      openssl
+                      libdrm
+                      # lemond, flm and its bundled XRT (libstdc++, libgomp)
+                      stdenv.cc.cc.lib
+                      # flm
+                      curl
+                      util-linux # libuuid
+                    ]
+                  )
+                }
               )
+            '';
+
+            # The bundler fills Name= from productName ("Unsloth"); show a clearer label in
+            # application menus without renaming the product (window title, bundle paths).
+            postInstall = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              for f in $out/share/applications/*.desktop; do
+                substituteInPlace "$f" --replace-fail 'Name=Unsloth' 'Name=Unsloth Desktop'
+              done
             '';
 
             # The crate's tests touch $HOME, spawn shells and need a display.
