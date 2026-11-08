@@ -263,6 +263,9 @@
             postInstall = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               for f in $out/share/applications/*.desktop; do
                 substituteInPlace "$f" --replace-fail 'Name=Unsloth' 'Name=Unsloth Desktop'
+                # tauri.conf.json sets no bundle category, so Categories= is empty and
+                # menus file the app under "Other"; put it under Development instead.
+                sed -i 's/^Categories=.*/Categories=Development;/' "$f"
               done
             '';
 
