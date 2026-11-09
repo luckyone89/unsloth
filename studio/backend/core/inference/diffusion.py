@@ -175,6 +175,7 @@ from .diffusion_flux3 import (
     FLUX3_COMPONENTS,
     FLUX3_COMPONENT_FOLDERS,
     FLUX3_INDEX,
+    flux3_storage_dtype,
     is_flux3_family,
     load_flux3_pipeline,
 )
@@ -182,6 +183,7 @@ from .diffusion_flux3 import REFERENCE_AREA as FLUX3_REFERENCE_AREA
 from .diffusion_small_host import (
     INT8_DENOISER_NAMES,
     decide_small_host,
+    enable_int8_act_ as small_host_enable_int8_act,
     download_first_enabled as small_host_download_first,
     engaged_on as small_host_engaged_on,
     host_commit_mib,
@@ -195,6 +197,7 @@ from .diffusion_small_host import (
 from .model_ids import hf_cache_repo_id
 from .safetensors_pread import pread_available
 from .diffusion_memory import (
+    pipe_small_host_int8,
     commit_load_budget_fraction,
     release_load_budget_fraction,
     vram_budget_scope,
@@ -320,6 +323,7 @@ from .diffusion_offload_prefetch import cross_forward_render, cross_forward_step
 from .diffusion_vae_fp16 import enable_fp16_vae_decode
 from .diffusion_vae_upcast import pipeline_upcasts_keep_storage
 from .diffusion_vae_tiling import install as install_wide_vae_tiles
+from .diffusion_gguf_lowbit import install_lowbit_iq
 from .diffusion_attention import (
     apply_attention_backend,
     attention_status_reason,
@@ -522,6 +526,8 @@ from .diffusion_transformer_quant import (
     denoiser_modules,
     explain_unusable_scheme,
     family_denies_scheme,
+    fp16_card_int8_host,
+    fp16_card_int8_scheme,
     mark_source_precision,
     nvfp4_gated_base,
     native_int8_act,
@@ -4498,6 +4504,9 @@ class DiffusionBackend:
                 and native_quant_host(target)
             ):
                 if native_quant_scheme(target, pinned, family = getattr(fam, "name", None)) is None:
+                    reason = explain_unusable_scheme(getattr(fam, "name", None), pinned)
+            elif model_kind == "pipeline" and pinned == TQ_INT8 and fp16_card_int8_host(target):
+                if fp16_card_int8_scheme(target, pinned, family = getattr(fam, "name", None)) is None:
                     reason = explain_unusable_scheme(getattr(fam, "name", None), pinned)
             elif (
                 model_kind == "pipeline"
@@ -8638,6 +8647,9 @@ class DiffusionBackend:
                         TQ_INT8 if rdna_auto_w8a8 is not None else transformer_quant_pinned,
                         family = getattr(fam, "name", None),
                     )
+                    or fp16_card_int8_scheme(
+                        target, transformer_quant_pinned, family = getattr(fam, "name", None)
+                    )
                     if kind == "pipeline"
                     else None
                 )
@@ -9684,6 +9696,11 @@ class DiffusionBackend:
                                             text_encoder = pipe_kwargs.get("text_encoder"),
                                             transformer = pipe_kwargs.get("transformer"),
                                             family_name = fam.name,
+                                            storage_dtype = flux3_storage_dtype(target, dtype),
+                                            # A transformer quant rebuilds the dense Linears it reads.
+                                            transformer_storage = transformer_quant_pinned is None
+                                            and native_scheme is None
+                                            and native_offload_scheme is None,
                                         )
                                     finally:
                                         self._stop_load_prefetch()
@@ -9924,6 +9941,8 @@ class DiffusionBackend:
                             # Before the prefix shim, which cannot wrap an unregistered class.
                             _register_unregistered_single_file_classes(logger)
                             if kind == "gguf":
+                                # IQ1 / IQ2 / IQ3 tensors diffusers' table lacks would refuse the file
+                                install_lowbit_iq(logger)
                                 # Dequantise the GGUF transformer on-device at the compute dtype.
                                 sf_kwargs["quantization_config"] = diffusers.GGUFQuantizationConfig(
                                     compute_dtype = dtype
@@ -9958,6 +9977,7 @@ class DiffusionBackend:
                                         fam.name,
                                         base,
                                         offload = _comfy_offload,
+                                        lora = _has_active_lora(loras),
                                     ),
                                     fp8_backend = comfy_fp8_backend(
                                         target,
@@ -10043,6 +10063,7 @@ class DiffusionBackend:
                                         config_source = _base_local_dir,
                                     ).get("text_encoder"),
                                     family_name = fam.name,
+                                    storage_dtype = flux3_storage_dtype(target, dtype),
                                 )
                             elif fam.name == MOSS_IMAGE_FAMILY_NAME:
                                 from .diffusion_moss_image import load_moss_image_pipeline
@@ -10215,6 +10236,26 @@ class DiffusionBackend:
                         if not hasattr(pending_cache_write, "start"):
                             pending_cache_write = None
                         self._raise_if_load_cancelled(_load_token)
+                    if (
+                        pipe is not None
+                        and kind == "pipeline"
+                        and transformer_quant_engaged is None
+                        and native_scheme == TQ_INT8
+                        and fp16_card_int8_host(target)
+                        and pipe_small_host_int8(pipe)
+                    ):
+                        # Already per-row int8 (small-host route): re-quantising would only re-round the codes.
+                        transformer_quant_engaged = TQ_INT8
+                        act_linears = sum(
+                            small_host_enable_int8_act(module)
+                            for _attr, module in denoiser_modules(pipe)
+                        )
+                        logger.info(
+                            "diffusion.transformer_quant: int8 runs on the small-host int8 weights (fp16-only "
+                            "GPU, %s compute; W8A8 armed on %d linears for float32 compute)",
+                            str(getattr(target, "dtype", None)).replace("torch.", ""),
+                            act_linears,
+                        )
                     # Quantise dense bf16 pipeline denoisers in place. The blocker excludes UNet and pre-quantised
                     # pipelines; offloaded plans stay dense unless whole-module.
                     if (
@@ -10245,7 +10286,10 @@ class DiffusionBackend:
                             None
                             if native_scheme is not None or native_offload_scheme is not None
                             else pipeline_quant_uncompilable
-                        ) or dense_quant_blocker(pipe)
+                        ) or dense_quant_blocker(
+                            pipe,
+                            allow_float16 = native_scheme is not None and fp16_card_int8_host(target),
+                        )
                         if pipeline_quant_blocker is not None:
                             logger.info(
                                 "diffusion.transformer_quant: skipped (%s)", pipeline_quant_blocker
@@ -10722,8 +10766,8 @@ class DiffusionBackend:
 
                     # Registered patches (diffusion_autoopt.patches), in their original order: the shared and per-arch
                     # compile-safe fusions on a speed tier (uninstalled on `off`, tracked by eager_patched), then the
-                    # per-pipe installs that gate themselves (Q2.1 fast step, FLUX.2 fused RoPE, ROCm FLUX.1 / FLUX.2
-                    # one-kernel RoPE + AdaLN).
+                    # per-pipe installs that gate themselves (Q2.1 fast step, FLUX.2 / FLUX.3 fused RoPE, ROCm FLUX.1 /
+                    # FLUX.2 one-kernel RoPE + AdaLN).
                     autoopt.install_patches(
                         autoopt.STAGE_LOAD_EAGER,
                         pipe = pipe,
@@ -11084,6 +11128,9 @@ class DiffusionBackend:
                     from .diffusion_qwenimage21_vision import configure_vision_attention
 
                     configure_vision_attention(pipe, family = fam.name, target = target, logger = logger)
+                    from .diffusion_qwenimage21_te import skip_text_encoder_kv_cache
+
+                    skip_text_encoder_kv_cache(pipe, logger = logger)
 
                     # After the TE quant, so the cache key reflects the encoders that run.
                     cond_cache.install(
@@ -11626,7 +11673,8 @@ class DiffusionBackend:
             return comfy_resident_mib(
                 single_file_path,
                 scan,
-                keep_int8 = comfy_int8_backend(target, name, base, offload = offload) is not None,
+                keep_int8 = comfy_int8_backend(target, name, base, offload = offload, lora = lora)
+                is not None,
                 keep_fp8 = comfy_fp8_backend(target, name, base, offload = offload) is not None,
                 fp8_stored = fp8_storage and comfy_fp8_storage(target, lora = lora),
                 target = target,
@@ -12176,6 +12224,7 @@ class DiffusionBackend:
                 check_cancelled = check_cancelled,
                 local_files_only = local_files_only,
                 family_name = getattr(fam, "name", None),
+                storage_dtype = flux3_storage_dtype(target, dtype),
             )
             check_cancelled()
             pipe.to(device)
