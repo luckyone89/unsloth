@@ -88,7 +88,7 @@
             src = frontendSrc;
             nodejs = pkgs.nodejs_22;
 
-            npmDepsHash = "sha256-W+yBYFeW5Tm+aMiF+hWjWwq7J15pv8nZ7tgzizpBTYg=";
+            npmDepsHash = "sha256-NNpEWtQPWRsxnkDHgVs3dkXAQNjTgqm6zTRKEbSVjT4=";
 
             # .npmrc's min-release-age / allow-git need npm >= 11.10; the deps are already
             # pinned and hashed by the lockfile here, so the fetcher ignores them.
