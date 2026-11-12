@@ -186,7 +186,7 @@
 
             cargoRoot = "studio/src-tauri";
             buildAndTestSubdir = "studio/src-tauri";
-            cargoHash = "sha256-LxEmOwuXJEQpUzixaD3z43ZoIiyinjnMn/s0Ksr9VGY=";
+            cargoHash = "sha256-1LzuiDSCOE8t0gAeOwoR0pby5P2X+4b9hv4Ori5aHzY=";
 
             postPatch = ''
               mkdir -p studio/frontend
