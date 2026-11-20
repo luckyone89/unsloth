@@ -211,6 +211,9 @@
 
             buildInputs = [
               pkgs.openssl
+              # nixpkgs' cargo setup hook exports AWS_LC_SYS_USE_SYSTEM=1, so aws-lc-sys
+              # (via aws-lc-rs) links against this instead of building its vendored copy.
+              pkgs.aws-lc
             ]
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
               with pkgs;
