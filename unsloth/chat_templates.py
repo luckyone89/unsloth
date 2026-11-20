@@ -1290,7 +1290,13 @@ gemma4_template = \
         {{ '<|think|>\n' }}
     {%- endif -%}
     {%- if messages[0]['role'] in ['system', 'developer'] -%}
-        {{ messages[0]['content'] | trim }}
+        {%- if messages[0]['content'] is string -%}
+            {{ messages[0]['content'] | trim }}
+        {%- elif messages[0]['content'] is sequence -%}
+            {%- for item in messages[0]['content'] -%}
+                {{ item['text'] | trim + ' ' }}
+            {%- endfor -%}
+        {%- endif -%}
         {%- set loop_messages = messages[1:] -%}
     {%- endif -%}
     {%- if tools is defined and tools -%}
@@ -1632,7 +1638,13 @@ gemma4_thinking_template = \
         {{ '<|think|>\n' }}
     {%- endif -%}
     {%- if messages[0]['role'] in ['system', 'developer'] -%}
-        {{ messages[0]['content'] | trim }}
+        {%- if messages[0]['content'] is string -%}
+            {{ messages[0]['content'] | trim }}
+        {%- elif messages[0]['content'] is sequence -%}
+            {%- for item in messages[0]['content'] -%}
+                {{ item['text'] | trim + ' ' }}
+            {%- endfor -%}
+        {%- endif -%}
         {%- set loop_messages = messages[1:] -%}
     {%- endif -%}
     {%- if tools is defined and tools -%}
@@ -2880,20 +2892,32 @@ def get_chat_template(
             "'" + _escape_jinja_literal(mapping[key]) + "'"
             for key in ("role", "content", "user", "assistant")
         )
+        # Per turn, not from messages[0]: datasets rows carry None for the other schema's columns.
         chat_template = \
-            "{%- if " + role + " in messages[0] -%}" + \
+            "{%- set unsloth_roles = {" + user + " : 'user', " + assistant + " : 'assistant'} -%}" + \
             "{%- set sharegpt = namespace(messages = []) -%}" + \
             "{%- for message in messages -%}" + \
-            "{%- set role = {" + user + " : 'user', " + assistant + " : 'assistant'}" + \
-            ".get(message[" + role + "], message[" + role + "]) -%}" + \
-            "{%- set sharegpt.messages = sharegpt.messages + " + \
-            "[dict(message, role = role, content = message[" + content + "]) if " + content + " in message " + \
-            "else dict(message, role = role)] -%}" + \
+            "{%- set mapped_role = message.get(" + role + ") -%}" + \
+            "{%- set mapped_content = message.get(" + content + ") -%}" + \
+            "{%- if mapped_role is not none and mapped_content is not none -%}" + \
+            "{%- set message = dict(message, role = unsloth_roles.get(mapped_role, mapped_role), content = mapped_content) -%}" + \
+            "{%- else -%}" + \
+            "{%- if mapped_role is not none -%}" + \
+            "{%- set message = dict(message, role = unsloth_roles.get(mapped_role, mapped_role)) -%}" + \
+            "{%- endif -%}" + \
+            "{%- if mapped_content is not none -%}" + \
+            "{%- set message = dict(message, content = mapped_content) -%}" + \
+            "{%- elif " + content + " in message and message.get('content') is none -%}" + \
+            "{%- set message = dict(message, content = none) -%}" + \
+            "{%- endif -%}" + \
+            "{%- endif -%}" + \
+            "{%- set sharegpt.messages = sharegpt.messages + [message] -%}" + \
             "{%- endfor -%}" + \
-            "{%- set messages = sharegpt.messages -%}" + \
-            "{%- endif %}" + \
+            "{%- set messages = sharegpt.messages %}" + \
             chat_template
 
+    # Only templates that bake the message in pass it on; applied after create_ollama_modelfile picks the template.
+    ollama_system_message = system_message if "{system_message}" in chat_template else None
     chat_template, system_message = _change_system_message(chat_template, type_chat_template, system_message)
 
     tokenizer.chat_template = chat_template
@@ -2917,6 +2941,7 @@ def get_chat_template(
     if _processor is not None:
         # GGUF export unwraps the processor before it builds the Ollama Modelfile.
         tokenizer._ollama_modelfile = ollama_modelfile
+        tokenizer._ollama_system_message = ollama_system_message
         _processor.tokenizer = tokenizer
         _processor.chat_template = chat_template
         for _token in ("bos_token", "eos_token", "pad_token",):
@@ -2930,6 +2955,7 @@ def get_chat_template(
         tokenizer = patch_saving_functions(tokenizer, vision = _processor is not None)
 
     tokenizer._ollama_modelfile = ollama_modelfile
+    tokenizer._ollama_system_message = ollama_system_message
     tokenizer._system_message   = system_message
     tokenizer._unsloth_chat_template_name = (
         (template_name, chat_template) if template_name is not None else None
@@ -3162,8 +3188,20 @@ def to_sharegpt(
 
 
 def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
-    added_tokens_decoder = tokenizer.added_tokens_decoder.values()
-    added_tokens_decoder = [str(x) for x in added_tokens_decoder]
+    # Non-special HTML tags (Gemma's `<b>`, `<table>`) are answer text, never turn delimiters.
+    html_tags = {
+        "a", "abbr", "article", "b", "blockquote", "body", "br", "button", "caption", "cite",
+        "code", "dd", "del", "div", "dl", "dt", "em", "figcaption", "figure", "footer", "form",
+        "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "i", "iframe", "img",
+        "input", "ins", "label", "li", "link", "main", "mark", "meta", "nav", "ol", "p", "pre",
+        "q", "script", "section", "small", "span", "strong", "style", "sub", "sup", "table",
+        "tbody", "td", "tfoot", "th", "thead", "title", "tr", "u", "ul",
+    }
+    added_tokens_decoder = [
+        str(x) for x in tokenizer.added_tokens_decoder.values()
+        if getattr(x, "special", True)
+        or not (str(x).startswith("<") and str(x).endswith(">") and str(x)[1:-1].lstrip("/") in html_tags)
+    ]
 
     # Longest first, never through a set: the collapse below rewrites joined_text as it goes,
     # so a family member must be seen before any shorter token sharing its prefix (`<unused0>`
@@ -3189,9 +3227,10 @@ def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
             for j in range(n//2+1, n):
                 if joined_text.count(token[:j]) < repeated_counts:
                     j -= 1
-                    # Remove repeated tokens to reduce search space
-                    joined_text = joined_text.replace(token[:j], "")
-                    repeated_tokens.append(token[:j])
+                    # A run ending at n//2 ("<", "</", "e") sits inside unrelated tokens: removing it rewrites them all.
+                    if j > n // 2:
+                        joined_text = joined_text.replace(token[:j], "")
+                        repeated_tokens.append(token[:j])
                     break
 
     split = joined_text.split("\x01\x00")
@@ -3201,8 +3240,8 @@ def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
 
     filtered_eos_tokens = []
     for token in final_eos_tokens:
-        if   token.count("\n") == len(token): continue
-        elif token.count("▁") == len(token): continue
+        # Whitespace-only stops ("\t", "\n\n", "▁▁") end generation at the first indent.
+        if   not token.replace("▁", "").strip(): continue
         elif token.startswith("<") and len(token) <= 2: continue
         elif token.startswith("</") and len(token) == 3: continue
         filtered_eos_tokens.append(token)
@@ -3645,11 +3684,14 @@ extra_eos_tokens = None,
 
     tokenizer.chat_template = jinja_template
     tokenizer._ollama_modelfile = modelfile
+    # This Modelfile already holds default_system_message; drop one left by an earlier get_chat_template.
+    tokenizer._ollama_system_message = None
     tokenizer._unsloth_input_part  = input_part
     tokenizer._unsloth_output_part = output_part
     if hasattr(tokenizer, "tokenizer"):
         tokenizer.tokenizer.chat_template = jinja_template
         tokenizer.tokenizer._ollama_modelfile = modelfile
+        tokenizer.tokenizer._ollama_system_message = None
         tokenizer.tokenizer._unsloth_input_part  = input_part
         tokenizer.tokenizer._unsloth_output_part = output_part
 

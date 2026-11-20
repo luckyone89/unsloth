@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from dataclasses import dataclass
@@ -29,6 +30,16 @@ from torch.nn.attention.flex_attention import (
 
 # torch 2.6 inductor fails on the dynamic mask + flex kernel; suppress_errors then runs eager T x T flex.
 PREFIX_GROUPER_MIN_TORCH = (2, 7)
+
+
+def _strict_dynamo():
+    """Dynamo with suppress_errors off; some torch builds (AMD's ROCm torch 2.11) have no such flag."""
+    config = torch._dynamo.config
+    return (
+        config.patch(suppress_errors = False)
+        if hasattr(config, "suppress_errors")
+        else contextlib.nullcontext()
+    )
 
 
 def torch_supports_prefix_grouper(version = None) -> bool:
@@ -164,6 +175,61 @@ def build_seg_info_multigroup(
     return seg, group_meta
 
 
+@dataclass
+class TreeSegInfo:
+    """A prefix trie laid out in DFS pre-order (TRL >= 1.17 AsyncGRPO rows), padded to T_pad.
+
+    Each segment's subtree is one contiguous token range, so kv token j is visible to query q iff
+    j <= q < reach_end[j], where reach_end[j] ends the subtree of j's segment; pad tokens hold -1.
+    """
+
+    reach_end: torch.Tensor
+    signature: Tuple
+    T: int
+    T_pad: int
+
+
+def build_tree_seg_info(segment_offsets, segment_parents, device: torch.device) -> TreeSegInfo:
+    """Raises ValueError unless segments are in DFS pre-order with every parent before its children."""
+    offsets = [int(x) for x in torch.as_tensor(segment_offsets).tolist()]
+    parents = [int(x) for x in torch.as_tensor(segment_parents).tolist()]
+    n = len(parents)
+    if n == 0 or len(offsets) != n + 1 or offsets[0] != 0:
+        raise ValueError("tree segments: expected S parents and S + 1 offsets starting at 0")
+    if any(b <= a for a, b in zip(offsets[:-1], offsets[1:])):
+        raise ValueError("tree segments: every segment needs at least one token")
+    end = list(range(1, n + 1))
+    for s in range(n - 1, -1, -1):
+        p = parents[s]
+        if p >= s:
+            raise ValueError("tree segments: a parent must precede its children")
+        if p >= 0:
+            end[p] = max(end[p], end[s])
+    # Pre-order check: each segment's parent is the innermost open subtree containing it.
+    stack = []
+    for s in range(n):
+        while stack and end[stack[-1]] <= s:
+            stack.pop()
+        if parents[s] != (stack[-1] if stack else -1):
+            raise ValueError("tree segments are not in DFS pre-order")
+        stack.append(s)
+    T = offsets[-1]
+    T_pad = _pad_len(T)
+    lengths = torch.tensor([b - a for a, b in zip(offsets[:-1], offsets[1:])], dtype = torch.long)
+    seg_end = torch.tensor([offsets[e] for e in end], dtype = torch.long)
+    reach_end = torch.full((T_pad,), -1, dtype = torch.long)
+    reach_end[:T] = torch.repeat_interleave(seg_end, lengths, output_size = T)
+    signature = ("tree", T_pad, tuple(offsets), tuple(parents))
+    return TreeSegInfo(reach_end = reach_end.to(device), signature = signature, T = T, T_pad = T_pad)
+
+
+def _make_tree_mask_mod(reach_end):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (kv_idx <= q_idx) & (q_idx < reach_end[kv_idx])
+
+    return mask_mod
+
+
 def _seg_labels_host(group_specs):
     """CPU int64 [3, T_pad] rows (group_of_kv, is_prefix, suffix_of_kv); T, T_pad, group_meta."""
     group_meta = []
@@ -256,9 +322,12 @@ def get_block_mask(
     compile_mask = compile_mask and seg.T_pad > _PAD_MULTIPLE
     builder = _create_block_mask_compiled if compile_mask else create_block_mask
     with torch.inference_mode(False):
-        mask_mod = _make_mask_mod(
-            seg.group_of_kv.to(device), seg.is_prefix.to(device), seg.suffix_of_kv.to(device)
-        )
+        if isinstance(seg, TreeSegInfo):
+            mask_mod = _make_tree_mask_mod(seg.reach_end.to(device))
+        else:
+            mask_mod = _make_mask_mod(
+                seg.group_of_kv.to(device), seg.is_prefix.to(device), seg.suffix_of_kv.to(device)
+            )
         bm = builder(
             mask_mod,
             B = 1,
@@ -362,6 +431,10 @@ def _compile_failure_reason(root: BaseException) -> str:
     return f"{type(root).__name__}: {lines[0][:200] if lines else ''}"
 
 
+def _keep_saved(tensor):
+    return tensor
+
+
 @torch._dynamo.disable
 def _checked_first_call(q, k, v, seg, block_mask, enable_gqa, scale, T, T_pad, key):
     """Real call plus fwd + bwd on detached copies, strict, so later calls reuse those graphs."""
@@ -369,11 +442,13 @@ def _checked_first_call(q, k, v, seg, block_mask, enable_gqa, scale, T, T_pad, k
 
     def strict_calls(one_stage):
         nonlocal block_mask
-        with torch._dynamo.config.patch(suppress_errors = False):
+        with _strict_dynamo():
             if block_mask is None:
                 block_mask = get_block_mask(seg, q.device, compile_mask = True)
             out = _run_flex(q, k, v, block_mask, enable_gqa, scale, True, T, T_pad, one_stage)
-            with torch.inference_mode(False), torch.enable_grad():
+            # Else inside a non-reentrant checkpoint the backward unpacks through it and stops recompute.
+            own_hooks = torch.autograd.graph.saved_tensors_hooks(_keep_saved, _keep_saved)
+            with torch.inference_mode(False), torch.enable_grad(), own_hooks:
                 qc, kc, vc = (x.detach().clone().requires_grad_(True) for x in (q, k, v))
                 oc = _run_flex(qc, kc, vc, block_mask, enable_gqa, scale, True, T, T_pad, one_stage)
                 torch.autograd.grad(oc.float().sum(), (qc, kc, vc))
@@ -412,7 +487,7 @@ def flex_shared_prefix_attention(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
-    prefix_seg_info: PrefixSegInfo,
+    prefix_seg_info: PrefixSegInfo | TreeSegInfo,
     scale: Optional[float] = None,
     block_mask: Optional[BlockMask] = None,
     compiled: bool = True,
@@ -453,6 +528,8 @@ __all__ = [
     "TORCH_SUPPORTS_PREFIX_GROUPER",
     "torch_supports_prefix_grouper",
     "PrefixSegInfo",
+    "TreeSegInfo",
+    "build_tree_seg_info",
     "build_seg_info_multigroup",
     "build_seg_info_from_layout",
     "get_block_mask",
